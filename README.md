@@ -1,8 +1,8 @@
 # kubernetes-eks
 
-Action to apply artifacts files in your [EKS](https://aws.amazon.com/pt/eks/) cluster.
+GitHub Action to apply Kubernetes manifest files in your [EKS](https://aws.amazon.com/pt/eks/) cluster.
 
-This action allows you to apply Kubernetes artifact files by simply pointing to the path where your file is located.
+Point to a file or directory, and this action will apply your manifests, monitor the rollout, and fail fast if something goes wrong — without waiting for the full timeout.
 
 <br>
 
@@ -21,7 +21,7 @@ jobs:
       - name: Checkout 
         uses: actions/checkout@v4
       - name: Deployment
-        uses: Pablommr/kubernetes-eks@v2.1.1
+        uses: Pablommr/kubernetes-eks@v2.1.2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -29,11 +29,13 @@ jobs:
           KUBE_YAML: path_to_file/file.yml
 ```
 
-
 <br>
 
 # Usage
-To use this action, you just need a user that has permission to apply artifacts in your EKS cluster. For more information, see this [link](https://docs.aws.amazon.com/eks/latest/userguide/add-user-role.html). Also, set up the necessary environment variables listed below.
+
+To use this action you need an IAM user with permission to apply resources in your EKS cluster. For more information, see the [AWS documentation](https://docs.aws.amazon.com/eks/latest/userguide/add-user-role.html).
+
+Set up the environment variables listed below and point to your manifest files via `KUBE_YAML` (individual files) or `FILES_PATH` (directory).
 
 <br>
 
@@ -43,25 +45,29 @@ To use this action, you just need a user that has permission to apply artifacts 
 
 ### `AWS_ACCESS_KEY_ID`
 
-AWS access key id for IAM role.
+AWS access key ID for the IAM role used to authenticate with the cluster.
 
 ### `AWS_SECRET_ACCESS_KEY`
 
-AWS secret key for IAM role. 
+AWS secret access key for the IAM role.
 
 ### `KUBECONFIG`
 
-Environment variable containing the base64-encoded kubeconfig data. Pay attention to the profile name; it must match the AWS_PROFILE_NAME.
+Base64-encoded kubeconfig file. The profile name inside the kubeconfig must match `AWS_PROFILE_NAME`.
 
 ### `KUBE_YAML` or `FILES_PATH`
 
-One of them (or both) must be set. <br><br>
+At least one of them must be set. Both can be used simultaneously.
 
-KUBE_YAML is the path of <b>file</b> to file used to create/update the resource. This env can be an array with more then 1 file. (I.e. kubernetes/deployment.yml,artifacts/configmap.yaml )<br><br>
+**`KUBE_YAML`** — path to one or more individual manifest files, separated by commas.
+```
+KUBE_YAML: kubernetes/deployment.yml,artifacts/configmap.yaml
+```
 
-FILES_PATH is the path of the <b>directory</b> where the files are located. All files in this current directory will be applied.<br><br>
-
-The files must be with *.yaml or *.yml extensions.
+**`FILES_PATH`** — path to a directory. All `.yaml` and `.yml` files directly inside the directory will be applied. Use `SUBPATH: true` to include subdirectories.
+```
+FILES_PATH: kubernetes
+```
 
 <br>
 
@@ -69,62 +75,100 @@ The files must be with *.yaml or *.yml extensions.
 
 ### `AWS_PROFILE_NAME`
 
-Profile name to be configured. If not passed, this env assume the value 'default'
+AWS credentials profile name to be written to `~/.aws/credentials`. Defaults to `default`.
 
 ### `ENVSUBST`
-(boolean)
+`boolean` — default: `false`
 
-Whether to run envsubst to substitute environment variables inside the file in KUBE_YAML. Your variable inside your file need begin with "$". If not passed, this env assume the value 'false'
+When `true`, substitutes environment variables inside the manifest files before applying them. Variables must be declared with `$` prefix (e.g., `$IMAGE_TAG`). Useful for injecting dynamic values such as image tags at deploy time.
 
 ### `SUBPATH`
-(boolean)
+`boolean` — default: `false`
 
-If you use path in env FILES_PATH, you can set this env to true to apply files in subdirectory. Default value is false.
+When `true` and using `FILES_PATH`, applies manifest files found in subdirectories as well. When `false`, only files at the top level of `FILES_PATH` are applied.
 
 ### `CONTINUE_IF_FAIL`
-(boolean)
+`boolean` — default: `false`
 
-If you use path in env FILES_PATH, you can set this env to true to continue applying files in case of fail in one file. Default value is false.
+When `true`, the action continues processing remaining files even if one apply or rollout fails. The pipeline will still exit with an error code at the end if any failure occurred. When `false`, the action stops immediately on the first failure.
 
 ### `KUBE_ROLLOUT`
-(boolean)
+`boolean` — default: `true`
 
-Whether to watch the status of the latest rollout until it's done. The rollout only works for Deployment, StatefulSet, or DaemonSet resources and will only be executed if the Pods applied by KUBE_YAML finalize with an unchanged status. Default value is true.
+When `true`, the action watches the rollout status after each apply for resources that manage Pods (`Deployment`, `ReplicaSet`, `DaemonSet`, `Pod`). The rollout is monitored until it completes successfully, fails, or reaches `KUBE_ROLLOUT_TIMEOUT`.
+
+If the resource was unchanged by the apply, a `kubectl rollout restart` is triggered automatically to ensure the latest configuration or image is rolled out.
 
 ### `KUBE_ROLLOUT_TIMEOUT`
-(String)
+`string` — default: `20m`
 
-Timeout to KUBE_ROLLOUT. This env must be in time format. (i.e.: 60s, 5m, 1h) and KUBE_ROLLOUT must be true. Defaul value is 20m.
+Maximum time to wait for a rollout to complete. Must be in time format: `60s`, `5m`, `1h`. Requires `KUBE_ROLLOUT: true`.
+
+<br>
+
+# Rollout behaviour
+
+When `KUBE_ROLLOUT` is enabled, the action handles two important scenarios:
+
+### Workflow cancellation
+
+The rollout monitor runs in the background, allowing the action to respond to cancellation signals from the GitHub Actions UI at any point during the rollout. Cancelling the workflow will stop the rollout immediately instead of leaving the step hanging.
+
+### CrashLoopBackOff detection
+
+The action polls the pod status every 5 seconds while waiting for the rollout. If any pod enters one of the following states, the pipeline fails immediately without waiting for the full timeout:
+
+| State | Cause |
+|---|---|
+| `CrashLoopBackOff` | Container is crashing repeatedly on startup |
+| `OOMKilled` | Container was terminated due to memory limit |
+| `ImagePullBackOff` | Docker image could not be pulled |
+| `ErrImagePull` | Error while pulling the Docker image |
+
+<br>
+
+# Application order
+
+Manifests are applied in the following order to respect Kubernetes resource dependencies:
+
+1. **Namespace** — must exist before any other resource.
+2. **All other resource types** (ConfigMap, Service, Ingress, etc.) — applied without rollout monitoring.
+3. **Pod-managing resources** (Deployment, ReplicaSet, DaemonSet, Pod) — applied with rollout monitoring when `KUBE_ROLLOUT: true`.
+4. **ScaledObject** (KEDA) — applied last, as it references a Deployment that must already exist.
 
 <br>
 
 # Use case
 
-Let's suppose you need to apply three artifacts in your EKS: one Deployment, one Service, and one ConfigMap. All your Kubernetes artifacts are inside the kubernetes folder, like this:
+Let's suppose you need to apply three artifacts in your EKS: one Deployment, one Service, and one ConfigMap. All your Kubernetes manifests are inside the `kubernetes` folder:
 
 ```
 ├── README.md
 ├── app
 |  └── files
 ├── kubernetes
-│   ├── deployment.yaml
-│   ├── envs
-│   │   ├── prod
-│   │   │   └── configmap.yaml
-│   │   └── staging
-│   │       └── configmap.yaml
-│   └── service.yaml
+│   ├── deployment.yaml
+│   ├── envs
+│   │   ├── prod
+│   │   │   └── configmap.yaml
+│   │   └── staging
+│   │       └── configmap.yaml
+│   └── service.yaml
 └── another_files
 ```
-You've already set up your build and just need to apply it in Kubernetes. Even if the only change was in the ConfigMap, you will need to roll out the pods. You want to apply just the prod ConfigMap, and you also need to substitute variables inside deployment.yml for some other value. Let's assume you want to change the image tag, so you can name your tag in the image line in deployment.yml with a placeholder, for example $IMAGE_TAG, like this:
 
-```
+You want to:
+- Apply `deployment.yaml` and `service.yaml` from the `kubernetes` folder (not subdirectories).
+- Apply only the prod `configmap.yaml` individually.
+- Substitute the image tag dynamically using `ENVSUBST`.
+
+In `deployment.yaml`, declare the image tag as a placeholder:
+
+```yaml
 image: nginx:$IMAGE_TAG
 ```
 
-Then, pass the IMAGE_TAG as an environment variable with the desired value.
-
-You can configure your pipeline like this:
+Then configure your pipeline:
 
 ```yml
 name: Build
@@ -149,21 +193,27 @@ jobs:
       - name: Checkout 
         uses: actions/checkout@v4
       - name: Deploy
-        uses: Pablommr/kubernetes-eks@v2.1.1
+        uses: Pablommr/kubernetes-eks@v2.1.2
         env:
           FILES_PATH: kubernetes
           KUBE_YAML: kubernetes/envs/prod/configmap.yaml
-          SUBPATH: false #Defaul value
+          SUBPATH: false
           ENVSUBST: true
           KUBE_ROLLOUT: true
+          KUBE_ROLLOUT_TIMEOUT: 10m
           IMAGE_TAG: 1.21.6
 ```
 
-In this setup, with FILES_PATH: kubernetes, you will apply all files under the kubernetes path (deployment.yaml and service.yaml), but none under env, since SUBPATH is set to false. However, you will still apply the ConfigMap with KUBE_YAML: kubernetes/envs/configmap.yaml.
+With `FILES_PATH: kubernetes` and `SUBPATH: false`, only `deployment.yaml` and `service.yaml` are applied from the directory. The prod ConfigMap is applied separately via `KUBE_YAML`. The `$IMAGE_TAG` placeholder in `deployment.yaml` is replaced with `1.21.6` before applying.
 
 <br>
 
 # Change Log
+
+## v2.1.2
+
+- Rollout cancellation: the pipeline now responds immediately to workflow cancellation from the GitHub Actions UI during a rollout, instead of waiting for the current step to finish.
+- CrashLoopBackOff fail fast: if any pod enters a failed state (`CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `ErrImagePull`) during a rollout, the pipeline fails immediately without waiting for the timeout.
 
 ## v2.1.1
 
