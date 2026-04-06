@@ -347,11 +347,45 @@ run_rollout_status () {
   # Necessário para filtrar apenas os pods deste deploy no loop de monitoramento.
   # Pods são ignorados aqui pois eles mesmos são monitorados diretamente abaixo.
   local selector=""
+  # Selector efetivo usado nos health checks. Para Deployments, é refinado para
+  # incluir apenas pods do novo ReplicaSet (ver bloco abaixo).
+  local active_selector=""
   if [ "$kind_lower" != "pod" ]; then
     sleep 2  # Aguarda brevemente para o recurso estar visível na API do Kubernetes.
     selector=$(kubectl get "$kind_lower" "$resource_name" -n "$namespace" \
       -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null \
       | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")' 2>/dev/null)
+
+    # Para Deployments: restringe o health check apenas aos pods do novo ReplicaSet,
+    # evitando falsos positivos causados por pods do ReplicaSet anterior que ainda
+    # estão em CrashLoopBackOff enquanto o novo rollout já está saudável.
+    #
+    # A lógica: busca o ReplicaSet cuja anotação deployment.kubernetes.io/revision
+    # corresponde à revisão atual do Deployment e extrai seu pod-template-hash.
+    # Esse hash é adicionado ao selector para filtrar apenas os pods novos.
+    if [ "$kind_lower" == "deployment" ] && [ -n "$selector" ]; then
+      local deploy_revision
+      deploy_revision=$(kubectl get deployment "$resource_name" -n "$namespace" \
+        -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null)
+
+      if [ -n "$deploy_revision" ]; then
+        local new_hash
+        new_hash=$(kubectl get rs -n "$namespace" -l "$selector" \
+          -o jsonpath="{.items[?(@.metadata.annotations['deployment\.kubernetes\.io/revision']=='$deploy_revision')].metadata.labels.pod-template-hash}" \
+          2>/dev/null)
+
+        if [ -n "$new_hash" ]; then
+          active_selector="$selector,pod-template-hash=$new_hash"
+          echo "Monitoring pods from new ReplicaSet (pod-template-hash=$new_hash)."
+        fi
+      fi
+    fi
+
+    # Para outros tipos (DaemonSet, ReplicaSet) ou se não foi possível obter o hash,
+    # usa o selector completo do recurso.
+    if [ -z "$active_selector" ]; then
+      active_selector="$selector"
+    fi
   fi
 
   # Loop de monitoramento: verifica a cada 3 segundos enquanto o rollout está rodando.
@@ -363,9 +397,9 @@ run_rollout_status () {
   #   - Error: container encerrou com código de erro (fase transiente antes do CrashLoopBackOff).
   while kill -0 "$ROLLOUT_PID" 2>/dev/null; do
     local crash_info=""
-    if [ -n "$selector" ]; then
-      # Para Deployments, DaemonSets e ReplicaSets: busca pods pelo selector do recurso.
-      crash_info=$(kubectl get pods -n "$namespace" -l "$selector" --no-headers 2>/dev/null \
+    if [ -n "$active_selector" ]; then
+      # Verifica apenas os pods do novo ReplicaSet (ou selector completo para outros tipos).
+      crash_info=$(kubectl get pods -n "$namespace" -l "$active_selector" --no-headers 2>/dev/null \
         | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -3)
     elif [ "$kind_lower" == "pod" ]; then
       # Para Pods standalone: verifica diretamente o status do pod pelo nome.
@@ -373,7 +407,7 @@ run_rollout_status () {
         | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -1)
     fi
 
-    # Se algum pod falhou, interrompe o rollout imediatamente (fail fast).
+    # Se algum pod do novo ReplicaSet falhou, interrompe o rollout imediatamente (fail fast).
     if [ -n "$crash_info" ]; then
       echo ""
       echo "ERROR: Pod(s) detected in failed state — failing fast:"
@@ -404,13 +438,14 @@ run_rollout_status () {
   # Aguarda KUBE_STABILITY_WINDOW segundos e re-verifica o estado dos pods.
   # Captura o cenário em que a aplicação crashou logo após o startup e o
   # rollout reportou sucesso antes dos pods entrarem em Error/CrashLoopBackOff.
+  # Usa o mesmo active_selector para verificar apenas os pods do novo ReplicaSet.
   # -------------------------------------------------------------------------
   echo "Rollout reported success. Running stability check (${KUBE_STABILITY_WINDOW}s)..."
   sleep "$KUBE_STABILITY_WINDOW"
 
   local post_crash_info=""
-  if [ -n "$selector" ]; then
-    post_crash_info=$(kubectl get pods -n "$namespace" -l "$selector" --no-headers 2>/dev/null \
+  if [ -n "$active_selector" ]; then
+    post_crash_info=$(kubectl get pods -n "$namespace" -l "$active_selector" --no-headers 2>/dev/null \
       | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -3)
   elif [ "$kind_lower" == "pod" ]; then
     post_crash_info=$(kubectl get pod "$resource_name" -n "$namespace" --no-headers 2>/dev/null \
