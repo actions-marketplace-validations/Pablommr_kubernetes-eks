@@ -91,6 +91,18 @@ if ! [[ $KUBE_ROLLOUT_TIMEOUT =~ ^[0-9]+[smh]$ ]]; then
     exit 1
 fi
 
+# KUBE_STABILITY_WINDOW define quantos segundos aguardar após o rollout concluir antes
+# de re-verificar os pods. Necessário para detectar aplicações que crasham após o startup
+# (o Kubernetes considera o pod "ready" antes do crash acontecer). Deve ser um inteiro.
+if [ -z "$KUBE_STABILITY_WINDOW" ]; then
+  KUBE_STABILITY_WINDOW=15
+  echo 'Env KUBE_STABILITY_WINDOW is empty! Using default 15s.'
+fi
+if ! [[ $KUBE_STABILITY_WINDOW =~ ^[0-9]+$ ]]; then
+    echo "Erro: KUBE_STABILITY_WINDOW must be a positive integer (seconds). (i.e.: 15, 30)"
+    exit 1
+fi
+
 echo ""
 
 # -----------------------------------------------------------------------------
@@ -284,18 +296,25 @@ envSubstitution () {
 # -----------------------------------------------------------------------------
 # run_rollout_status
 #
-# Substitui a chamada direta de "kubectl rollout status" para resolver dois
+# Substitui a chamada direta de "kubectl rollout status" para resolver três
 # problemas:
 #
 #   1. CANCELAMENTO PELO GITHUB ACTIONS:
 #      O kubectl roda em background. Um trap em SIGTERM/SIGINT mata o processo
 #      e encerra o script quando o usuário cancela o workflow pela UI.
 #
-#   2. DETECÇÃO RÁPIDA DE CRASHLOOPBACKOFF:
-#      Enquanto o rollout está pendente, um loop verifica a cada 5 segundos
+#   2. DETECÇÃO RÁPIDA DE CRASHLOOPBACKOFF DURANTE O ROLLOUT:
+#      Enquanto o rollout está pendente, um loop verifica a cada 3 segundos
 #      se algum pod do recurso entrou em estado de falha. Se detectado, o
 #      kubectl em background é morto e a função retorna erro imediatamente,
 #      sem aguardar o timeout completo.
+#
+#   3. STABILITY CHECK PÓS-ROLLOUT:
+#      O Kubernetes considera um pod "ready" assim que o container inicia,
+#      antes que a aplicação tenha chance de crashar. Se a aplicação falha
+#      alguns segundos após o startup, o rollout reporta sucesso e os pods
+#      só entram em Error/CrashLoopBackOff depois. Após o rollout concluir,
+#      aguarda KUBE_STABILITY_WINDOW segundos e re-verifica os pods.
 #
 # Parâmetros:
 #   $1 — caminho do arquivo YAML do recurso
@@ -335,21 +354,23 @@ run_rollout_status () {
       | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")' 2>/dev/null)
   fi
 
-  # Loop de monitoramento: verifica a cada 5 segundos enquanto o rollout está rodando.
+  # Loop de monitoramento: verifica a cada 3 segundos enquanto o rollout está rodando.
+  # Intervalo curto para capturar crashes rápidos antes do rollout avançar para o próximo pod.
   # Estados de falha monitorados:
   #   - CrashLoopBackOff: container falha repetidamente ao iniciar.
   #   - OOMKilled: container encerrado por falta de memória.
   #   - ImagePullBackOff / ErrImagePull: imagem Docker não pode ser baixada.
+  #   - Error: container encerrou com código de erro (fase transiente antes do CrashLoopBackOff).
   while kill -0 "$ROLLOUT_PID" 2>/dev/null; do
     local crash_info=""
     if [ -n "$selector" ]; then
       # Para Deployments, DaemonSets e ReplicaSets: busca pods pelo selector do recurso.
       crash_info=$(kubectl get pods -n "$namespace" -l "$selector" --no-headers 2>/dev/null \
-        | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull)" | head -3)
+        | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -3)
     elif [ "$kind_lower" == "pod" ]; then
       # Para Pods standalone: verifica diretamente o status do pod pelo nome.
       crash_info=$(kubectl get pod "$resource_name" -n "$namespace" --no-headers 2>/dev/null \
-        | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull)" | head -1)
+        | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -1)
     fi
 
     # Se algum pod falhou, interrompe o rollout imediatamente (fail fast).
@@ -362,16 +383,49 @@ run_rollout_status () {
       trap - SIGTERM SIGINT
       return 1
     fi
-    sleep 5
+    sleep 3
   done
 
   # Aguarda o kubectl terminar e captura o código de saída (0 = sucesso, !0 = falha/timeout).
   wait "$ROLLOUT_PID"
   local rollout_exit=$?
 
-  # Remove o trap após o rollout concluir normalmente para não afetar outros comandos.
+  # Remove o trap após o rollout concluir para não afetar outros comandos.
   trap - SIGTERM SIGINT
-  return $rollout_exit
+
+  # Se o próprio kubectl reportou falha (ex: timeout), retorna imediatamente.
+  if [ $rollout_exit -ne 0 ]; then
+    return $rollout_exit
+  fi
+
+  # -------------------------------------------------------------------------
+  # Stability check pós-rollout.
+  #
+  # Aguarda KUBE_STABILITY_WINDOW segundos e re-verifica o estado dos pods.
+  # Captura o cenário em que a aplicação crashou logo após o startup e o
+  # rollout reportou sucesso antes dos pods entrarem em Error/CrashLoopBackOff.
+  # -------------------------------------------------------------------------
+  echo "Rollout reported success. Running stability check (${KUBE_STABILITY_WINDOW}s)..."
+  sleep "$KUBE_STABILITY_WINDOW"
+
+  local post_crash_info=""
+  if [ -n "$selector" ]; then
+    post_crash_info=$(kubectl get pods -n "$namespace" -l "$selector" --no-headers 2>/dev/null \
+      | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -3)
+  elif [ "$kind_lower" == "pod" ]; then
+    post_crash_info=$(kubectl get pod "$resource_name" -n "$namespace" --no-headers 2>/dev/null \
+      | grep -E "(CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|Error)" | head -1)
+  fi
+
+  if [ -n "$post_crash_info" ]; then
+    echo ""
+    echo "ERROR: Post-rollout stability check failed — pod(s) entered failed state after rollout:"
+    echo "$post_crash_info"
+    return 1
+  fi
+
+  echo "Stability check passed."
+  return 0
 }
 
 # -----------------------------------------------------------------------------

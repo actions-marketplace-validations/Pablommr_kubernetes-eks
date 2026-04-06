@@ -104,6 +104,11 @@ If the resource was unchanged by the apply, a `kubectl rollout restart` is trigg
 
 Maximum time to wait for a rollout to complete. Must be in time format: `60s`, `5m`, `1h`. Requires `KUBE_ROLLOUT: true`.
 
+### `KUBE_STABILITY_WINDOW`
+`integer` — default: `15`
+
+Number of seconds to wait after the rollout reports success before doing a final pod health check. This catches the case where an application crashes shortly after startup: Kubernetes considers the pod "ready" as soon as the container starts, before it has a chance to fail. Set a value higher than your application's startup time to ensure the check is meaningful. Requires `KUBE_ROLLOUT: true`.
+
 <br>
 
 # Rollout behaviour
@@ -114,9 +119,9 @@ When `KUBE_ROLLOUT` is enabled, the action handles two important scenarios:
 
 The rollout monitor runs in the background, allowing the action to respond to cancellation signals from the GitHub Actions UI at any point during the rollout. Cancelling the workflow will stop the rollout immediately instead of leaving the step hanging.
 
-### CrashLoopBackOff detection
+### CrashLoopBackOff detection during rollout
 
-The action polls the pod status every 5 seconds while waiting for the rollout. If any pod enters one of the following states, the pipeline fails immediately without waiting for the full timeout:
+The action polls the pod status every 3 seconds while waiting for the rollout. If any pod enters one of the following states, the pipeline fails immediately without waiting for the full timeout:
 
 | State | Cause |
 |---|---|
@@ -124,6 +129,12 @@ The action polls the pod status every 5 seconds while waiting for the rollout. I
 | `OOMKilled` | Container was terminated due to memory limit |
 | `ImagePullBackOff` | Docker image could not be pulled |
 | `ErrImagePull` | Error while pulling the Docker image |
+
+### Post-rollout stability check
+
+Kubernetes marks a pod as "ready" as soon as the container process starts — before the application has time to crash. In this scenario, the rollout finishes successfully while pods silently start crashing in the background.
+
+After `kubectl rollout status` reports success, the action waits `KUBE_STABILITY_WINDOW` seconds (default: 15) and re-checks all pods. If any pod is in a failed state at that point, the pipeline fails. Set `KUBE_STABILITY_WINDOW` to a value greater than your application's startup time to ensure the check is meaningful.
 
 <br>
 
