@@ -19,20 +19,48 @@ echo ""
 echo "Checking ENVs..."
 
 # -----------------------------------------------------------------------------
-# Validação das variáveis de ambiente obrigatórias.
-# O script falha imediatamente se qualquer uma delas estiver ausente,
-# pois sem elas não é possível autenticar na AWS nem no cluster.
+# Validação das variáveis de ambiente e detecção do modo de autenticação.
+#
+# CREDENCIAIS AWS — duas formas:
+#   - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY definidos -> grava o
+#     ~/.aws/credentials como sempre (incluindo aws_session_token quando
+#     AWS_SESSION_TOKEN existir, necessário para credenciais temporárias STS).
+#   - Ambos vazios -> usa as credenciais ambientes do processo (ex.: exportadas
+#     por aws-actions/configure-aws-credentials via OIDC keyless, instance
+#     role, etc). Nada é gravado em disco.
+#
+# KUBECONFIG — duas formas:
+#   - CLUSTER_NAME definido -> o kubeconfig é GERADO em runtime via
+#     `aws eks update-kubeconfig` (requer região em AWS_REGION ou
+#     AWS_DEFAULT_REGION). Dispensa a env KUBECONFIG.
+#   - CLUSTER_NAME vazio    -> comportamento original: KUBECONFIG em base64.
+#
+# Retrocompatibilidade: chamadas existentes (keys + KUBECONFIG, sem
+# CLUSTER_NAME) seguem o fluxo original sem nenhuma mudança de comportamento.
 # -----------------------------------------------------------------------------
-if [ -z "$AWS_ACCESS_KEY_ID" ]; then
-  echo 'Env AWS_ACCESS_KEY_ID is empty! Please, fulfil it with your aws access key...'
+
+# Credenciais: ou o par completo de keys, ou nenhuma (credenciais ambientes).
+if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+  echo 'Env AWS_SECRET_ACCESS_KEY is empty! Fulfil it with your aws access secret, or unset AWS_ACCESS_KEY_ID to use ambient credentials...'
   exit 1
-elif [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-  echo 'Env AWS_SECRET_ACCESS_KEY is empty! Please, fulfil  with your aws access secret...'
+elif [ -z "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+  echo 'Env AWS_ACCESS_KEY_ID is empty! Fulfil it with your aws access key, or unset AWS_SECRET_ACCESS_KEY to use ambient credentials...'
   exit 1
-elif [ -z "$KUBECONFIG" ]; then
-  echo 'Env KUBECONFIG is empty! Please, fulfil it with your kubeconfig in base64...'
+fi
+
+# Kubeconfig: gerado em runtime (CLUSTER_NAME) ou fornecido em base64 (KUBECONFIG).
+if [ -z "$CLUSTER_NAME" ] && [ -z "$KUBECONFIG" ]; then
+  echo 'Envs CLUSTER_NAME and KUBECONFIG are empty! Fulfil CLUSTER_NAME (kubeconfig generated at runtime via `aws eks update-kubeconfig`) or KUBECONFIG (base64)...'
   exit 1
-elif [ -z "$KUBE_YAML" ]; then
+fi
+
+# update-kubeconfig exige uma região explícita.
+if [ -n "$CLUSTER_NAME" ] && [ -z "$AWS_REGION" ] && [ -z "$AWS_DEFAULT_REGION" ]; then
+  echo 'Env CLUSTER_NAME is set but AWS_REGION (or AWS_DEFAULT_REGION) is empty! Fulfil it with the cluster region...'
+  exit 1
+fi
+
+if [ -z "$KUBE_YAML" ]; then
   # Aceita FILES_PATH como alternativa a KUBE_YAML para apontar um diretório inteiro.
   if [ -z "$FILES_PATH" ]; then
     echo "Envs KUBE_YAML or FILES_PATH is empty or file doesn't exist! Please, fulfil it with full path where your file is..."
@@ -106,26 +134,59 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# Configuração das credenciais AWS e do kubeconfig.
-# Os valores chegam como variáveis de ambiente e são gravados nos paths
-# esperados pelo AWS CLI e pelo kubectl, respectivamente.
+# Configuração das credenciais AWS e do kubeconfig, conforme o modo detectado
+# na validação acima.
 # -----------------------------------------------------------------------------
 mkdir -p ~/.aws
 mkdir -p ~/.kube
 
-AWS_CREDENTIALS_PATH='~/.aws/credentials'
 KUBECONFIG_PATH='~/.kube/config'
 
-# Grava o arquivo de credenciais AWS com o perfil configurado.
-echo "[$AWS_PROFILE_NAME]" > $(eval echo $AWS_CREDENTIALS_PATH)
-echo "aws_access_key_id = $AWS_ACCESS_KEY_ID" >> $(eval echo $AWS_CREDENTIALS_PATH)
-echo "aws_secret_access_key = $AWS_SECRET_ACCESS_KEY" >> $(eval echo $AWS_CREDENTIALS_PATH)
+# Credenciais: grava o arquivo apenas quando as keys foram fornecidas.
+# Sem keys, o AWS CLI resolve as credenciais ambientes (env/role) sozinho —
+# nada é gravado em disco.
+if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+  AWS_CREDENTIALS_PATH='~/.aws/credentials'
+  echo "[$AWS_PROFILE_NAME]" > $(eval echo $AWS_CREDENTIALS_PATH)
+  echo "aws_access_key_id = $AWS_ACCESS_KEY_ID" >> $(eval echo $AWS_CREDENTIALS_PATH)
+  echo "aws_secret_access_key = $AWS_SECRET_ACCESS_KEY" >> $(eval echo $AWS_CREDENTIALS_PATH)
+  # Credenciais temporárias (STS/OIDC) só funcionam com o session token junto.
+  if [ -n "$AWS_SESSION_TOKEN" ]; then
+    echo "aws_session_token = $AWS_SESSION_TOKEN" >> $(eval echo $AWS_CREDENTIALS_PATH)
+  fi
+  echo "AWS credentials: keys written to profile [$AWS_PROFILE_NAME]."
+else
+  echo 'AWS credentials: none provided, using ambient credentials (env/role).'
+fi
 
-# Decodifica o kubeconfig (enviado em base64) e salva no path padrão do kubectl.
-echo "$KUBECONFIG" |base64 -d > $(eval echo $KUBECONFIG_PATH)
+# Falha rápido, com mensagem clara, se não há credencial utilizável — e loga a
+# identidade efetiva (útil para auditoria do deploy).
+CALLER_IDENTITY=$(aws sts get-caller-identity --query Arn --output text 2>&1)
+if [ $? -ne 0 ]; then
+  echo 'Unable to authenticate on AWS! Check your credentials (keys or ambient). Error:'
+  echo "$CALLER_IDENTITY"
+  exit 1
+fi
+echo "Authenticated on AWS as: $CALLER_IDENTITY"
 
-# Remove a variável KUBECONFIG do ambiente para evitar conflito com o arquivo gravado acima.
-unset KUBECONFIG
+if [ -n "$CLUSTER_NAME" ]; then
+  # Gera o kubeconfig em runtime a partir do cluster — dispensa o KUBECONFIG
+  # em base64 (e o risco de um kubeconfig eterno vazar junto com secrets).
+  REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
+  echo "Generating kubeconfig via aws eks update-kubeconfig ($CLUSTER_NAME @ $REGION)..."
+  unset KUBECONFIG
+  aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --kubeconfig $(eval echo $KUBECONFIG_PATH)
+  if [ $? -ne 0 ]; then
+    echo "Failed to generate kubeconfig for cluster $CLUSTER_NAME!"
+    exit 1
+  fi
+else
+  # Decodifica o kubeconfig (enviado em base64) e salva no path padrão do kubectl.
+  echo "$KUBECONFIG" |base64 -d > $(eval echo $KUBECONFIG_PATH)
+
+  # Remove a variável KUBECONFIG do ambiente para evitar conflito com o arquivo gravado acima.
+  unset KUBECONFIG
+fi
 
 
 ###================================

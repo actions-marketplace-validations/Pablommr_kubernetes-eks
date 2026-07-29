@@ -7,13 +7,39 @@ Point to a file or directory, and this action will apply your manifests, monitor
 <br>
 
 # Example
+
+Keyless (recommended) — OIDC via [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials), no long-lived secrets:
 ```yml
-name: Build
+name: Deploy
 
 on:
   push:
     branches: [ main ]
 
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::111122223333:role/my-deploy-role
+          aws-region: us-east-1
+      - name: Deployment
+        uses: Pablommr/kubernetes-eks@v2.2.0
+        env:
+          CLUSTER_NAME: my-eks-cluster
+          KUBE_YAML: path_to_file/file.yml
+```
+
+Classic — static access key + base64 kubeconfig (still fully supported):
+```yml
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -21,7 +47,7 @@ jobs:
       - name: Checkout 
         uses: actions/checkout@v4
       - name: Deployment
-        uses: Pablommr/kubernetes-eks@v2.1.2
+        uses: Pablommr/kubernetes-eks@v2.2.0
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -33,7 +59,7 @@ jobs:
 
 # Usage
 
-To use this action you need an IAM user with permission to apply resources in your EKS cluster. For more information, see the [AWS documentation](https://docs.aws.amazon.com/eks/latest/userguide/add-user-role.html).
+You need an AWS identity with permission to apply resources in your EKS cluster — either an IAM role assumed via OIDC (keyless, recommended) or an IAM user with static keys. For more information, see the [AWS documentation](https://docs.aws.amazon.com/eks/latest/userguide/add-user-role.html).
 
 Set up the environment variables listed below and point to your manifest files via `KUBE_YAML` (individual files) or `FILES_PATH` (directory).
 
@@ -41,19 +67,23 @@ Set up the environment variables listed below and point to your manifest files v
 
 # ENV's
 
+## Authentication
+
+### AWS credentials — two ways
+
+**Ambient credentials (keyless, recommended)** — leave `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` unset and the action uses whatever credentials are already available in the environment: the temporary credentials exported by `aws-actions/configure-aws-credentials` (OIDC), an instance role on a self-hosted runner, etc. Nothing is written to disk.
+
+**Static keys** — set `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN` for temporary STS credentials). They are written to `~/.aws/credentials` under `AWS_PROFILE_NAME`, exactly as before.
+
+In both cases the action validates the identity with `aws sts get-caller-identity` before applying anything, and logs the effective ARN for auditability.
+
+### Cluster access — two ways
+
+**`CLUSTER_NAME` (keyless, recommended)** — the kubeconfig is generated at runtime with `aws eks update-kubeconfig`. Requires the cluster region in `AWS_REGION` (or `AWS_DEFAULT_REGION`). No `KUBECONFIG` secret needed.
+
+**`KUBECONFIG`** — base64-encoded kubeconfig file, as before. The profile name inside the kubeconfig must match `AWS_PROFILE_NAME`.
+
 ## Required
-
-### `AWS_ACCESS_KEY_ID`
-
-AWS access key ID for the IAM role used to authenticate with the cluster.
-
-### `AWS_SECRET_ACCESS_KEY`
-
-AWS secret access key for the IAM role.
-
-### `KUBECONFIG`
-
-Base64-encoded kubeconfig file. The profile name inside the kubeconfig must match `AWS_PROFILE_NAME`.
 
 ### `KUBE_YAML` or `FILES_PATH`
 
@@ -75,7 +105,15 @@ FILES_PATH: kubernetes
 
 ### `AWS_PROFILE_NAME`
 
-AWS credentials profile name to be written to `~/.aws/credentials`. Defaults to `default`.
+AWS credentials profile name to be written to `~/.aws/credentials`. Defaults to `default`. Only used with static keys — ignored with ambient credentials.
+
+### `AWS_SESSION_TOKEN`
+
+Session token for temporary STS credentials, written to `~/.aws/credentials` alongside the keys. Only relevant with static keys — ambient credentials carry their own token.
+
+### `AWS_REGION`
+
+Cluster region, required when using `CLUSTER_NAME` (falls back to `AWS_DEFAULT_REGION`). Already exported automatically by `aws-actions/configure-aws-credentials`.
 
 ### `ENVSUBST`
 `boolean` — default: `false`
@@ -220,6 +258,14 @@ With `FILES_PATH: kubernetes` and `SUBPATH: false`, only `deployment.yaml` and `
 <br>
 
 # Change Log
+
+## v2.2.0
+
+- Keyless authentication: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are now optional — when unset, the action uses ambient credentials (e.g. OIDC temporary credentials exported by `aws-actions/configure-aws-credentials`, or an instance role). Nothing is written to disk in this mode.
+- Runtime kubeconfig: new `CLUSTER_NAME` env generates the kubeconfig via `aws eks update-kubeconfig` (requires `AWS_REGION`/`AWS_DEFAULT_REGION`), removing the need for a base64 `KUBECONFIG` secret.
+- `AWS_SESSION_TOKEN` support when writing static credentials, enabling temporary STS keys in the classic mode.
+- Fail-fast identity check: `aws sts get-caller-identity` runs before any apply and the effective ARN is logged for auditability.
+- Fully backward compatible: existing setups (keys + `KUBECONFIG`) behave exactly as before.
 
 ## v2.1.2
 
