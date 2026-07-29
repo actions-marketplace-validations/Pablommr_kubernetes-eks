@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout 
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Deployment
         uses: Pablommr/kubernetes-eks@v2.2.0
         env:
@@ -240,7 +240,7 @@ jobs:
     needs: build_and_push
     steps:
       - name: Checkout 
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Deploy
         uses: Pablommr/kubernetes-eks@v2.1.2
         env:
